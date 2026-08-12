@@ -1,0 +1,5 @@
+﻿Mapping_ID,BusinessType_Code,UI_Display_Value,Source_Rule_Value,Applicable_SubLine_Code,Mapping_Type,Is_Active
+BM_001,BT_RO_RN,Renewal,RO/RN,ALL,UI_ALIAS,Y
+BM_002,BT_RO_RN,Rollover,RO/RN,ALL,UI_ALIAS,Y
+BM_003,BT_NEW,New,NEW(1+3),SL_PKG,NEW_VARIANT,Y
+BM_004,BT_NEW,New,NEW(1+5),SL_PKG,NEW_VARIANT,Y

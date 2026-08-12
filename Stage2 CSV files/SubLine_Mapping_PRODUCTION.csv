@@ -1,0 +1,6 @@
+﻿Mapping_ID,Original_Value,SubLine_Code,UI_Display_Value,Is_Active
+SLM_001,PKG,SL_PKG,Package,Y
+SLM_002,PACKAGE,SL_PKG,Package,Y
+SLM_003,SAOD,SL_SAOD,SAOD,Y
+SLM_004,TP,SL_TP,TP,Y
+SLM_005,SATP,SL_TP,TP,Y

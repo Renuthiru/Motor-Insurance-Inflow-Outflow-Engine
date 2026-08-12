@@ -1,0 +1,6 @@
+﻿Product_Code,Product_Name,Is_Active
+PROD_2W,Two Wheeler,Y
+PROD_GCV,Goods Carrying Vehicle,Y
+PROD_MISC,Miscellaneous Vehicle,Y
+PROD_PCV,Passenger Carrying Vehicle,Y
+PROD_PC,Private Car,Y

@@ -1,0 +1,3 @@
+﻿BusinessType_Code,Canonical_Business_Type,UI_Display_Value,Is_Active
+BT_RO_RN,RO/RN,Renewal / Rollover,Y
+BT_NEW,NEW,New,Y

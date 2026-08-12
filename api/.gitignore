@@ -1,0 +1,22 @@
+# ============================================================
+# .gitignore — Files that should NEVER be committed to Git
+# ============================================================
+
+# Secret credentials — NEVER commit this
+.env
+
+# Python virtual environment — too large, reinstall with requirements.txt
+venv/
+
+# Python cache files — auto-generated, not needed in Git
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db
