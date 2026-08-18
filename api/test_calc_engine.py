@@ -1,4 +1,4 @@
-﻿import urllib.request
+import urllib.request
 import json
 import sys
 sys.path.append(r"D:\Inflow\api")
@@ -39,6 +39,7 @@ print("  INFLOW CALCULATION ENGINE -- COMPLETE TEST SUITE")
 print("=" * 60)
 
 BASE = {
+    "requested_date": "2026-07-15",   # resolves to 2026-07-01 (July version)
     "product": "Two Wheeler",
     "subproduct": "Bike",
     "business_type": "New",
@@ -86,6 +87,7 @@ L(8, "Impossible CC 999999cc => no match", not r8.get("matched"),
   "err=%s" % r8.get("error"))
 
 r9 = post("/calculate-inflow", {
+    "requested_date": "2026-07-15",
     "product": "Two Wheeler", "subproduct": "Bike",
     "business_type": "New", "subline": "Package",
     "state": "UTTARKHAND", "location": "ALL",
@@ -96,6 +98,7 @@ L(9, "UTTARKHAND+ALL => LOC_UK_ALL wildcard multi-insurer",
   "count=%s err=%s std=%s" % (len(r9.get("results",[])), r9.get("error"), r9.get("standardized_input")))
 
 r10 = post("/calculate-inflow", {
+    "requested_date": "2026-07-15",
     "product": "Two Wheeler", "subproduct": "Bike",
     "business_type": "New", "subline": "Package",
     "state": "GOA", "location": "ALL",
@@ -106,6 +109,7 @@ L(10, "GOA+ALL => LOC_GA_ALL state-wide wildcard",
   "count=%s err=%s" % (len(r10.get("results",[])), r10.get("error")))
 
 r11 = post("/calculate-inflow", {
+    "requested_date": "2026-07-15",
     "product": "Miscellaneous Vehicle", "subproduct": "Bulldozer",
     "business_type": "Renewal", "subline": "Package",
     "state": "ANDHARA PRADESH", "location": "VIJAYAWADA"
@@ -135,11 +139,13 @@ sql_q = (
     "WHERE product_code='PROD_2W' AND subproduct_code='SP_2W_BIKE' "
     "AND business_type_code='BT_NEW' AND rule_business_variant='NEW(1+5)' "
     "AND subline_code='SL_PKG' AND state_code='ST_AP' "
-    "AND location_code='LOC_AP_VIJAYAWADA'"
+    "AND location_code='LOC_AP_VIJAYAWADA' "
+    "AND effective_from = '2026-07-01'"
 )
 with engine.connect() as conn:
     dbrows = conn.execute(text(sql_q)).fetchall()
 apir = post("/inflow-lookup", {
+    "requested_date": "2026-07-15",
     "product": "Two Wheeler", "subproduct": "Bike", "business_type": "New",
     "subline": "Package", "state": "ANDHARA PRADESH", "location": "VIJAYAWADA"
 })
@@ -164,6 +170,7 @@ for ep in eps:
 L(16, "All existing endpoints still responding", all_ok16)
 
 rl = post("/rule-lookup", {
+    "requested_date": "2026-07-15",
     "product_code": "PROD_2W", "subproduct_code": "SP_2W_BIKE",
     "business_type_code": "BT_NEW", "rule_business_variant": "NEW(1+5)",
     "subline_code": "SL_PKG", "state_code": "ST_AP",

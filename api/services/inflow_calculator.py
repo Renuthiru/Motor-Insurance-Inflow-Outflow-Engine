@@ -3,8 +3,15 @@
 # ============================================================
 # Purpose: Core calculation engine that evaluates vehicle and
 #          business conditions against parsed inflow expressions.
+#
+# EFFECTIVE-DATE FLOW:
+#   req.requested_date is passed directly into
+#   RuleService.perform_rule_lookup(), which resolves the
+#   effective date once and version-locks all Rule Master queries.
+#   The calculator never resolves dates independently.
 # ============================================================
 
+from datetime import date as DateType
 from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.orm import Session
 from schemas.rule_schema import RuleLookupRequest
@@ -21,13 +28,20 @@ class InflowCalculator:
         db: Session,
         req: InflowCalculationRequest,
         std_codes: Any
-    ) -> Tuple[bool, List[CalculatedInsurerResult], Optional[str]]:
+    ) -> Tuple[bool, List[CalculatedInsurerResult], Optional[str], Optional[DateType]]:
         """
         Executes Rule Master lookup using standardized codes, then evaluates
         parsed segment conditions against vehicle specs to return matching rates.
+
+        Returns a 4-tuple: (matched, results, error_message, effective_date_used)
+
+        req.requested_date is forwarded to RuleService.perform_rule_lookup()
+        which resolves the effective date once. The calculator never queries
+        Rule Master directly and never sees all versions.
         """
-        # 1. Perform Rule Lookup (with wildcard fallbacks)
+        # 1. Build the 7-dimension lookup request
         lookup_req = RuleLookupRequest(
+            requested_date=req.requested_date,
             product_code=std_codes.product_code,
             subproduct_code=std_codes.subproduct_code,
             business_type_code=std_codes.business_type_code,
@@ -36,28 +50,31 @@ class InflowCalculator:
             state_code=std_codes.state_code,
             location_code=std_codes.location_code
         )
-        
-        matched, db_rules, error_msg = RuleService.perform_rule_lookup(db, lookup_req)
+
+        # 2. Perform Rule Lookup (with wildcard fallbacks, version-locked)
+        matched, db_rules, error_msg, effective_date_used = RuleService.perform_rule_lookup(
+            db, lookup_req, req.requested_date
+        )
         if not matched:
-            return False, [], error_msg or "No matching rule found in database"
+            return False, [], error_msg or "No matching rule found in database", effective_date_used
 
         results = []
 
-        # 2. Iterate through each matching insurer rule
+        # 3. Iterate through each matching insurer rule
         for rule in db_rules:
-            insurer = rule["insurer"]
+            insurer   = rule["insurer"]
             raw_inflow = rule["inflow"]
 
             # Parse inflow text into structured segments
             segments = InflowParser.parse_expression(raw_inflow)
-            
+
             matched_segment = None
-            highest_score = -1
+            highest_score   = -1
 
             # Match segments against vehicle parameters
             for seg in segments:
                 # Calculate specificity matching score
-                score = 0
+                score    = 0
                 is_match = True
 
                 # A. Coverage Filter
@@ -117,24 +134,24 @@ class InflowCalculator:
                             score += 2
 
                 if is_match and score > highest_score:
-                    highest_score = score
+                    highest_score   = score
                     matched_segment = seg
 
             if matched_segment:
                 # Map conditions dict for client transparency
                 conditions_info = {
-                    "coverage": matched_segment["coverage"],
-                    "cpa": matched_segment["cpa"],
-                    "cc_min": matched_segment["cc_min"],
-                    "cc_max": matched_segment["cc_max"],
-                    "gvw_min": matched_segment["gvw_min"],
-                    "gvw_max": matched_segment["gvw_max"],
-                    "allowed_makes": matched_segment["allowed_makes"],
+                    "coverage":       matched_segment["coverage"],
+                    "cpa":            matched_segment["cpa"],
+                    "cc_min":         matched_segment["cc_min"],
+                    "cc_max":         matched_segment["cc_max"],
+                    "gvw_min":        matched_segment["gvw_min"],
+                    "gvw_max":        matched_segment["gvw_max"],
+                    "allowed_makes":  matched_segment["allowed_makes"],
                     "exclude_models": matched_segment["exclude_models"],
-                    "age_min": matched_segment["age_min"],
-                    "age_max": matched_segment["age_max"],
+                    "age_min":        matched_segment["age_min"],
+                    "age_max":        matched_segment["age_max"],
                 }
-                
+
                 results.append(CalculatedInsurerResult(
                     insurer=insurer,
                     rate=matched_segment["rate"],
@@ -143,8 +160,13 @@ class InflowCalculator:
                     conditions=conditions_info
                 ))
             else:
-                # If no specific segment conditions matched but there is a default (unconditional) segment
-                unconditional_seg = next((s for s in segments if s["coverage"] == "ALL" and s["cpa"] is None and s["cc_max"] is None and not s["allowed_makes"]), None)
+                # If no specific segment matched, try the unconditional (default) segment
+                unconditional_seg = next(
+                    (s for s in segments
+                     if s["coverage"] == "ALL" and s["cpa"] is None
+                     and s["cc_max"] is None and not s["allowed_makes"]),
+                    None
+                )
                 if unconditional_seg:
                     results.append(CalculatedInsurerResult(
                         insurer=insurer,
@@ -155,6 +177,6 @@ class InflowCalculator:
                     ))
 
         if not results:
-            return False, [], "No segments within rule matched the provided vehicle inputs"
+            return False, [], "No segments within rule matched the provided vehicle inputs", effective_date_used
 
-        return True, results, None
+        return True, results, None, effective_date_used

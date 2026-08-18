@@ -4,6 +4,7 @@
 # Purpose: Pydantic schemas for the Inflow Calculation Engine.
 # ============================================================
 
+from datetime import date
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 
@@ -12,13 +13,22 @@ from pydantic import BaseModel, Field
 # 1. Calculation Request Schema
 # -----------------------------------------------------------
 class InflowCalculationRequest(BaseModel):
+    requested_date: date = Field(
+        ...,
+        example="2026-07-15",
+        description=(
+            "Calendar date for which to find the applicable Rule Master version. "
+            "The system selects MAX(effective_from) WHERE effective_from <= requested_date. "
+            "Format: YYYY-MM-DD"
+        )
+    )
     product: Optional[str] = Field(None, example="Two Wheeler", description="Raw Product Name")
     subproduct: Optional[str] = Field(None, example="Bike", description="Raw SubProduct Name")
     business_type: Optional[str] = Field(None, example="New", description="Raw Business Type")
     subline: Optional[str] = Field(None, example="Package", description="Raw SubLine Name")
     state: Optional[str] = Field(None, example="UTTARAKHAND", description="Raw State Name")
     location: Optional[str] = Field(None, example="DEHRADUN", description="Raw Location Name")
-    
+
     # Vehicle specifications for evaluating rules
     vehicle_make: Optional[str] = Field(None, example="SUZUKI", description="Vehicle Manufacturer (e.g., SUZUKI, HERO)")
     vehicle_model: Optional[str] = Field(None, example="BOLERO", description="Vehicle Model (e.g., BOLERO)")
@@ -43,9 +53,13 @@ class CalculatedInsurerResult(BaseModel):
 
 # -----------------------------------------------------------
 # 3. Overall Calculation Response Schema
+#    Includes both the requested_date and the resolved
+#    effective_date_used for full auditability.
 # -----------------------------------------------------------
 class InflowCalculationResponse(BaseModel):
     matched: bool
+    requested_date: Optional[date] = None
+    effective_date_used: Optional[date] = None
     standardized_input: Optional[Dict[str, Any]] = None
     results: List[CalculatedInsurerResult] = []
     error: Optional[str] = None

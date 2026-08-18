@@ -4,9 +4,28 @@
 # Purpose: Core business logic for:
 #          1. Standardizing raw input values via Mapping tables.
 #          2. Validating State-Location relationships.
-#          3. Querying RULE_MASTER with wildcard precedence.
+#          3. Resolving the correct Rule Master effective date.
+#          4. Querying RULE_MASTER with wildcard precedence,
+#             version-locked to the resolved effective date.
+#
+# EFFECTIVE-DATE ARCHITECTURE:
+#   The effective date is resolved ONCE per lookup via
+#   resolve_effective_date(). The resolved date is then passed
+#   to every execute_rule_query() call. This guarantees that
+#   ALL lookup paths (exact, location wildcard, SP_MISC_ALL)
+#   operate against exactly ONE Rule Master version.
+#
+#   There is ZERO possibility of mixing July dimensions with
+#   August inflow, or any other cross-version data contamination.
+#
+# WILDCARD PRECEDENCE (unchanged):
+#   1. Exact 7-dimension match
+#   2. State-wide location wildcard (LOC_xx_ALL)
+#   3. PROD_MISC + SP_MISC_ALL fallback
+#   4. PROD_MISC + SP_MISC_ALL + Location ALL fallback
 # ============================================================
 
+from datetime import date as DateType
 from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -20,6 +39,48 @@ from schemas.rule_schema import (
 
 class RuleService:
 
+    # ----------------------------------------------------------
+    # resolve_effective_date
+    # ----------------------------------------------------------
+    @staticmethod
+    def resolve_effective_date(
+        db: Session,
+        requested_date: DateType
+    ) -> Optional[DateType]:
+        """
+        Resolves the applicable Rule Master version date for the given
+        calendar date using the business rule:
+
+            SELECT MAX(effective_from)
+            FROM rule_master
+            WHERE effective_from <= :requested_date
+
+        Returns the resolved effective_from date if found, or None if
+        no Rule Master version exists for the requested date.
+
+        CRITICAL RULE: There is NO forward-fallback.
+        If requested_date is before ALL known effective_from values,
+        None is returned — never a future version.
+
+        Example:
+          Available: 2026-07-01, 2026-08-01
+          requested_date = 2026-07-20  → returns 2026-07-01
+          requested_date = 2026-08-15  → returns 2026-08-01
+          requested_date = 2026-06-30  → returns None (no error swallowing)
+        """
+        sql = text("""
+            SELECT MAX(effective_from) AS resolved_date
+            FROM rule_master
+            WHERE effective_from <= :requested_date
+        """)
+        row = db.execute(sql, {"requested_date": requested_date}).fetchone()
+        if row and row.resolved_date is not None:
+            return row.resolved_date
+        return None
+
+    # ----------------------------------------------------------
+    # execute_rule_query
+    # ----------------------------------------------------------
     @staticmethod
     def execute_rule_query(
         db: Session,
@@ -29,16 +90,27 @@ class RuleService:
         rule_business_variant: Optional[str],
         subline_code: Optional[str],
         state_code: Optional[str],
-        location_code: Optional[str]
+        location_code: Optional[str],
+        effective_from: DateType
     ) -> List[Dict[str, str]]:
         """
-        Executes parameterized SELECT on rule_master for a given set of dimension codes (supports optional/partial dimensions).
+        Executes a parameterized SELECT on rule_master for a given set
+        of dimension codes, version-locked to exactly one effective date.
+
+        The effective_from parameter is REQUIRED and must be a resolved
+        date from resolve_effective_date(). It is never resolved here.
+
         Returns list of dicts: [{"insurer": ..., "inflow": ...}]
+
+        Optional-dimension IS NULL behaviour is preserved: passing None
+        for any dimension code removes that dimension from the WHERE
+        clause, allowing partial/wildcard lookups.
         """
         sql = text("""
             SELECT DISTINCT insurer, inflow
             FROM rule_master
-            WHERE (:product_code IS NULL OR product_code = :product_code)
+            WHERE effective_from = :effective_from
+              AND (:product_code IS NULL OR product_code = :product_code)
               AND (:subproduct_code IS NULL OR subproduct_code = :subproduct_code)
               AND (:business_type_code IS NULL OR business_type_code = :business_type_code)
               AND (:rule_business_variant IS NULL OR rule_business_variant = :rule_business_variant)
@@ -48,45 +120,85 @@ class RuleService:
             ORDER BY insurer
         """)
         params = {
-            "product_code": product_code if product_code else None,
-            "subproduct_code": subproduct_code if subproduct_code else None,
-            "business_type_code": business_type_code if business_type_code else None,
+            "effective_from":        effective_from,
+            "product_code":          product_code          if product_code          else None,
+            "subproduct_code":       subproduct_code       if subproduct_code       else None,
+            "business_type_code":    business_type_code    if business_type_code    else None,
             "rule_business_variant": rule_business_variant if rule_business_variant else None,
-            "subline_code": subline_code if subline_code else None,
-            "state_code": state_code if state_code else None,
-            "location_code": location_code if location_code else None
+            "subline_code":          subline_code          if subline_code          else None,
+            "state_code":            state_code            if state_code            else None,
+            "location_code":         location_code         if location_code         else None,
         }
         rows = db.execute(sql, params).fetchall()
         return [dict(r._mapping) for r in rows]
 
+    # ----------------------------------------------------------
+    # perform_rule_lookup
+    # ----------------------------------------------------------
     @classmethod
     def perform_rule_lookup(
         cls,
         db: Session,
-        req: RuleLookupRequest
-    ) -> Tuple[bool, List[Dict[str, str]], Optional[str]]:
+        req: RuleLookupRequest,
+        requested_date: DateType
+    ) -> Tuple[bool, List[Dict[str, str]], Optional[str], Optional[DateType]]:
         """
-        Performs rule lookup with deterministic wildcard fallback precedence:
-        Precedence 1: Exact 7-dimension match
-        Precedence 2: State-wide location ALL match (e.g. LOC_xx_ALL)
-        Precedence 3: Subproduct ALL match (SP_MISC_ALL) if product is PROD_MISC
+        Performs rule lookup with deterministic wildcard fallback precedence.
+        Returns a 4-tuple: (matched, results, error_message, effective_date_used)
+
+        Lookup flow:
+          1. Validate product and state codes exist in master tables.
+          2. Resolve effective_from ONCE using resolve_effective_date().
+             If no applicable version exists → return clear business error.
+          3. Execute exact 7-dimension match using resolved effective_from.
+          4. If no exact match → state-wide location wildcard (LOC_xx_ALL).
+          5. If PROD_MISC → SP_MISC_ALL subproduct fallback.
+          6. If PROD_MISC → SP_MISC_ALL + location ALL combined fallback.
+
+        The resolved effective_from is used in ALL lookup paths.
+        There is no per-branch date re-resolution.
+
+        Wildcard precedence (unchanged from original):
+          P1: Exact 7-dimension match
+          P2: State-wide location ALL match (e.g. LOC_xx_ALL)
+          P3: Subproduct ALL match (SP_MISC_ALL) if product is PROD_MISC
+          P4: PROD_MISC + SP_MISC_ALL + Location ALL combined
         """
-        # Validate that product and state exist in master tables if provided
+        # --- Step 1: Validate master codes ---
         if req.product_code:
-            check_prod = db.execute(text("SELECT 1 FROM product_master WHERE product_code = :c"), {"c": req.product_code}).fetchone()
+            check_prod = db.execute(
+                text("SELECT 1 FROM product_master WHERE product_code = :c"),
+                {"c": req.product_code}
+            ).fetchone()
             if not check_prod:
-                return False, [], f"Invalid product_code: '{req.product_code}'"
+                return False, [], f"Invalid product_code: '{req.product_code}'", None
 
         if req.state_code:
-            check_state = db.execute(text("SELECT 1 FROM state_master WHERE state_code = :c"), {"c": req.state_code}).fetchone()
+            check_state = db.execute(
+                text("SELECT 1 FROM state_master WHERE state_code = :c"),
+                {"c": req.state_code}
+            ).fetchone()
             if not check_state:
-                return False, [], f"Invalid state_code: '{req.state_code}'"
+                return False, [], f"Invalid state_code: '{req.state_code}'", None
 
         # Check if explicitly provided location code is completely invalid
         if req.location_code and not req.location_code.endswith("_ALL") and req.location_code != "ALL":
-            check_loc = db.execute(text("SELECT 1 FROM location_master WHERE location_code = :c"), {"c": req.location_code}).fetchone()
+            check_loc = db.execute(
+                text("SELECT 1 FROM location_master WHERE location_code = :c"),
+                {"c": req.location_code}
+            ).fetchone()
             if not check_loc:
-                return False, [], f"Invalid location_code: '{req.location_code}'"
+                return False, [], f"Invalid location_code: '{req.location_code}'", None
+
+        # --- Step 2: Resolve effective date (single resolution for entire lookup) ---
+        effective_from = cls.resolve_effective_date(db, requested_date)
+        if effective_from is None:
+            return (
+                False, [],
+                f"No applicable Rule Master version exists for requested date '{requested_date}'. "
+                f"The requested date is before the first available Rule Master version.",
+                None
+            )
 
         # --- Precedence 1: Exact Match ---
         results = cls.execute_rule_query(
@@ -97,13 +209,16 @@ class RuleService:
             req.rule_business_variant,
             req.subline_code,
             req.state_code,
-            req.location_code
+            req.location_code,
+            effective_from
         )
         if results:
-            return True, results, None
+            return True, results, None, effective_from
 
-        # --- Precedence 2: State-Wide Location Wildcard (e.g., LOC_xx_ALL or location_type='ALL_STATE') ---
-        if req.location_code and req.state_code and not req.location_code.endswith("_ALL") and req.location_code != "ALL":
+        # --- Precedence 2: State-Wide Location Wildcard ---
+        if (req.location_code and req.state_code
+                and not req.location_code.endswith("_ALL")
+                and req.location_code != "ALL"):
             state_all_sql = text("""
                 SELECT location_code
                 FROM location_master
@@ -122,12 +237,13 @@ class RuleService:
                     req.rule_business_variant,
                     req.subline_code,
                     req.state_code,
-                    wildcard_loc_code
+                    wildcard_loc_code,
+                    effective_from       # same resolved version
                 )
                 if results:
-                    return True, results, None
+                    return True, results, None, effective_from
 
-        # --- Precedence 3: Subproduct ALL Wildcard (e.g., SP_MISC_ALL) ---
+        # --- Precedence 3: Subproduct ALL Wildcard (SP_MISC_ALL) ---
         if req.product_code == "PROD_MISC" and req.subproduct_code != "SP_MISC_ALL":
             results = cls.execute_rule_query(
                 db,
@@ -137,13 +253,16 @@ class RuleService:
                 req.rule_business_variant,
                 req.subline_code,
                 req.state_code,
-                req.location_code
+                req.location_code,
+                effective_from           # same resolved version
             )
             if results:
-                return True, results, None
+                return True, results, None, effective_from
 
-            # Attempt SP_MISC_ALL + Location ALL together
-            if req.location_code and req.state_code and not req.location_code.endswith("_ALL") and req.location_code != "ALL":
+            # --- Precedence 4: SP_MISC_ALL + Location ALL combined ---
+            if (req.location_code and req.state_code
+                    and not req.location_code.endswith("_ALL")
+                    and req.location_code != "ALL"):
                 state_all_sql = text("""
                     SELECT location_code
                     FROM location_master
@@ -161,14 +280,18 @@ class RuleService:
                         req.rule_business_variant,
                         req.subline_code,
                         req.state_code,
-                        state_all_row.location_code
+                        state_all_row.location_code,
+                        effective_from   # same resolved version
                     )
                     if results:
-                        return True, results, None
+                        return True, results, None, effective_from
 
-        # No match found
-        return False, [], "No matching rule found for the given parameters"
+        # No match found across all precedence levels
+        return False, [], "No matching rule found for the given parameters", effective_from
 
+    # ----------------------------------------------------------
+    # standardize_raw_input
+    # ----------------------------------------------------------
     @classmethod
     def standardize_raw_input(
         cls,
@@ -176,23 +299,27 @@ class RuleService:
         raw: RawInflowLookupRequest
     ) -> Tuple[Optional[StandardizedCodesInfo], Optional[str]]:
         """
-        Resolves user-entered raw strings into standardized internal codes using mapping tables.
-        Also validates state-location relationship.
-        """
-        raw_prod = raw.product.strip() if raw.product else None
-        raw_subprod = raw.subproduct.strip() if raw.subproduct else None
-        raw_bt = raw.business_type.strip() if raw.business_type else None
-        raw_subline = raw.subline.strip() if raw.subline else None
-        raw_state = raw.state.strip() if raw.state else None
-        raw_loc = raw.location.strip() if raw.location else None
+        Resolves user-entered raw strings into standardized internal codes
+        using mapping tables. Also validates state-location relationship.
 
-        std_product_code = None
-        std_subproduct_code = None
-        std_subline_code = None
-        std_state_code = None
-        std_location_code = None
+        Note: This method does NOT perform effective-date resolution.
+              Date resolution happens in perform_rule_lookup() after
+              standardization is complete.
+        """
+        raw_prod    = raw.product.strip()       if raw.product       else None
+        raw_subprod = raw.subproduct.strip()    if raw.subproduct    else None
+        raw_bt      = raw.business_type.strip() if raw.business_type else None
+        raw_subline = raw.subline.strip()       if raw.subline       else None
+        raw_state   = raw.state.strip()         if raw.state         else None
+        raw_loc     = raw.location.strip()      if raw.location      else None
+
+        std_product_code      = None
+        std_subproduct_code   = None
+        std_subline_code      = None
+        std_state_code        = None
+        std_location_code     = None
         std_business_type_code = None
-        std_variant = None
+        std_variant           = None
 
         # -----------------------------------------------------------
         # 1. Product Standardization
@@ -320,15 +447,13 @@ class RuleService:
                     std_variant = bt_rows[0].source_rule_value
 
         std_info = StandardizedCodesInfo(
-            product_code=std_product_code or "",
-            subproduct_code=std_subproduct_code or "",
+            product_code=std_product_code         or "",
+            subproduct_code=std_subproduct_code   or "",
             business_type_code=std_business_type_code or "",
-            rule_business_variant=std_variant or "",
-            subline_code=std_subline_code or "",
-            state_code=std_state_code or "",
-            location_code=std_location_code or ""
+            rule_business_variant=std_variant     or "",
+            subline_code=std_subline_code         or "",
+            state_code=std_state_code             or "",
+            location_code=std_location_code       or ""
         )
-
-        return std_info, None
 
         return std_info, None

@@ -28,13 +28,25 @@ load_dotenv()
 
 # -----------------------------------------------------------
 # Read each credential from environment variables.
-# If a variable is missing, use a safe default or raise an error.
+# DB_PASSWORD has NO fallback default — it MUST exist in .env
+# or the environment. Hardcoding credentials in source code
+# is a security violation and is explicitly forbidden here.
 # -----------------------------------------------------------
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Renuga@2002")
-DB_NAME = os.getenv("DB_NAME", "inflow_db")
+DB_HOST     = os.getenv("DB_HOST",     "localhost")
+DB_PORT     = os.getenv("DB_PORT",     "3306")
+DB_USER     = os.getenv("DB_USER",     "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD")          # NO fallback — must be in .env
+DB_NAME     = os.getenv("DB_NAME",     "inflow_db")
+
+# Guard: fail fast at startup if the password is missing.
+# This prevents the application from starting with no credentials
+# rather than silently connecting with a blank or wrong password.
+if not DB_PASSWORD:
+    raise RuntimeError(
+        "DB_PASSWORD environment variable is not set. "
+        "Please add it to your .env file. "
+        "Do not hardcode credentials in source code."
+    )
 
 # -----------------------------------------------------------
 # Build the database URL using SQLAlchemy's URL.create().
@@ -96,10 +108,10 @@ class Base(DeclarativeBase):
 
 # -----------------------------------------------------------
 # get_db — FastAPI Dependency.
-# 
+#
 # A "dependency" in FastAPI is a function that FastAPI calls
 # automatically before running your route handler.
-# 
+#
 # How it works:
 #   1. FastAPI sees that a route needs "db: Session"
 #   2. FastAPI calls get_db()
@@ -107,7 +119,7 @@ class Base(DeclarativeBase):
 #   4. FastAPI passes that session into the route
 #   5. After the route finishes, get_db() closes the session
 #      (the "finally" block always runs — even if an error occurs)
-# 
+#
 # This ensures every request gets a fresh session and it is
 # always cleaned up, preventing connection leaks.
 # -----------------------------------------------------------
